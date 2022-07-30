@@ -566,8 +566,6 @@ if __name__ == '__main__':
         # print(vis_e.shape)
         # print(ffeat.shape)
 
-        print(coord_predictions.detach().cpu().numpy()[:,0,:,:].squeeze().astype(int))
-
         # Export the model
         onnx_path = "../pips.onnx"
         torch.onnx.export(model,
