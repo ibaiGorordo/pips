@@ -22,24 +22,20 @@ def bilinear_sample2d(im, x, y, return_inbounds=False):
     x1 = x0 + 1
     y0 = torch.floor(y).int()
     y1 = y0 + 1
-    
-    x0_clip = torch.clamp(x0, 0, max_x)
-    x1_clip = torch.clamp(x1, 0, max_x)
-    y0_clip = torch.clamp(y0, 0, max_y)
-    y1_clip = torch.clamp(y1, 0, max_y)
+
     dim2 = W
     dim1 = W * H
 
     base = torch.arange(0, B, dtype=torch.int64).cuda()*dim1
     base = torch.reshape(base, [B, 1]).repeat([1, N])
 
-    base_y0 = base + y0_clip * dim2
-    base_y1 = base + y1_clip * dim2
+    base_y0 = base + y0 * dim2
+    base_y1 = base + y1 * dim2
 
-    idx_y0_x0 = base_y0 + x0_clip
-    idx_y0_x1 = base_y0 + x1_clip
-    idx_y1_x0 = base_y1 + x0_clip
-    idx_y1_x1 = base_y1 + x1_clip
+    idx_y0_x0 = base_y0 + x0
+    idx_y0_x1 = base_y0 + x1
+    idx_y1_x0 = base_y1 + x0
+    idx_y1_x1 = base_y1 + x1
 
     # use the indices to lookup pixels in the flat image
     # im is B x C x H x W

@@ -8,7 +8,6 @@ from utils.basic import print_stats
 import utils.samp
 import utils.misc
 from torch import nn, einsum
-from einops import rearrange, repeat
 from einops.layers.torch import Rearrange, Reduce
 
 def balanced_ce_loss(pred, gt):
@@ -121,34 +120,6 @@ def exists(val):
 def default(val, d):
     return val if exists(val) else d
 
-def get_sincos_embedding(x, y, z, C):
-    B, N, M = x.shape
-    B, N, M = y.shape
-    B, N, M = z.shape
-
-    x = x.unsqueeze(1)
-    y = y.unsqueeze(1)
-    z = z.unsqueeze(1)
-    
-    div_term = (torch.arange(0, C, 2).float() * (10000.0 / C)).reshape(1, int(C/2), 1, 1).to(x.device)
-    
-    pe_x = torch.zeros(B, C, N, M).to(x.device)
-    pe_y = torch.zeros(B, C, N, M).to(x.device)
-    pe_z = torch.zeros(B, C, N, M).to(x.device)
-
-    pe_x[:, 0::2] = torch.sin(x * div_term)
-    pe_x[:, 1::2] = torch.cos(x * div_term)
-    
-    pe_y[:, 0::2] = torch.sin(y * div_term)
-    pe_y[:, 1::2] = torch.cos(y * div_term)
-
-    pe_z[:, 0::2] = torch.sin(z * div_term)
-    pe_z[:, 1::2] = torch.cos(z * div_term)
-
-    pe = torch.cat([pe_x, pe_y, pe_z], dim=1)
-    return pe
-
-
 class ResidualBlock(nn.Module):
     def __init__(self, in_planes, planes, norm_fn='group', stride=1):
         super(ResidualBlock, self).__init__()
@@ -172,10 +143,10 @@ class ResidualBlock(nn.Module):
                 self.norm3 = nn.BatchNorm2d(planes)
         
         elif norm_fn == 'instance':
-            self.norm1 = nn.InstanceNorm2d(planes)
-            self.norm2 = nn.InstanceNorm2d(planes)
+            self.norm1 = InstanceNormAlternative(planes)
+            self.norm2 = InstanceNormAlternative(planes)
             if not stride == 1:
-                self.norm3 = nn.InstanceNorm2d(planes)
+                self.norm3 = InstanceNormAlternative(planes)
 
         elif norm_fn == 'none':
             self.norm1 = nn.Sequential()
@@ -200,7 +171,24 @@ class ResidualBlock(nn.Module):
             x = self.downsample(x)
 
         return self.relu(x+y)
-    
+
+# Ref: https://zenn.dev/pinto0309/scraps/1fa87e6fa6f918
+class InstanceNormAlternative(nn.InstanceNorm2d):
+    def forward(self, inp: torch.Tensor) -> torch.Tensor:
+        self._check_input_dim(inp)
+        desc = 1 / (inp.var(axis=[2, 3], keepdim=True, unbiased=False) + self.eps) ** 0.5
+        retval = (inp - inp.mean(axis=[2, 3], keepdim=True)) * desc
+        return retval
+
+class GroupNormAlternative(nn.GroupNorm):
+
+    def forward(self, inp: torch.Tensor) -> torch.Tensor:
+        self._check_input_dim(inp)
+
+        desc = 1 / (input.var(axis=[2, 3], keepdim=True, unbiased=False) + self.eps) ** 0.5
+        retval = (input - input.mean(axis=[2, 3], keepdim=True)) * desc
+        return retval
+
 class BasicEncoder(nn.Module):
     def __init__(self, input_dim=3, output_dim=128, stride=8, norm_fn='batch', dropout=0.0):
         super(BasicEncoder, self).__init__()
@@ -218,8 +206,8 @@ class BasicEncoder(nn.Module):
             self.norm2 = nn.BatchNorm2d(output_dim*2)
 
         elif self.norm_fn == 'instance':
-            self.norm1 = nn.InstanceNorm2d(self.in_planes)
-            self.norm2 = nn.InstanceNorm2d(output_dim*2)
+            self.norm1 = InstanceNormAlternative(self.in_planes)
+            self.norm2 = InstanceNormAlternative(output_dim*2)
 
         elif self.norm_fn == 'none':
             self.norm1 = nn.Sequential()
@@ -250,7 +238,7 @@ class BasicEncoder(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d, nn.GroupNorm)):
+            elif isinstance(m, (nn.BatchNorm2d, InstanceNormAlternative, nn.GroupNorm)):
                 if m.weight is not None:
                     nn.init.constant_(m.weight, 1)
                 if m.bias is not None:
@@ -274,23 +262,26 @@ class BasicEncoder(nn.Module):
         x = self.relu1(x)
 
 
+        H8 = torch.div(H, self.stride, rounding_mode='trunc')
+        W8 = torch.div(W, self.stride, rounding_mode='trunc')
+
         if self.shallow:
             a = self.layer1(x)
             b = self.layer2(a)
             c = self.layer3(b)
-            a = F.interpolate(a, (H//self.stride, W//self.stride), mode='bilinear', align_corners=True)
-            b = F.interpolate(b, (H//self.stride, W//self.stride), mode='bilinear', align_corners=True)
-            c = F.interpolate(c, (H//self.stride, W//self.stride), mode='bilinear', align_corners=True)
+            a = F.interpolate(a, (H8, W8), mode='bilinear', align_corners=True)
+            b = F.interpolate(b, (H8, W8), mode='bilinear', align_corners=True)
+            c = F.interpolate(c, (H8, W8), mode='bilinear', align_corners=True)
             x = self.conv2(torch.cat([a,b,c], dim=1))
         else:
             a = self.layer1(x)
             b = self.layer2(a)
             c = self.layer3(b)
             d = self.layer4(c)
-            a = F.interpolate(a, (H//self.stride, W//self.stride), mode='bilinear', align_corners=True)
-            b = F.interpolate(b, (H//self.stride, W//self.stride), mode='bilinear', align_corners=True)
-            c = F.interpolate(c, (H//self.stride, W//self.stride), mode='bilinear', align_corners=True)
-            d = F.interpolate(d, (H//self.stride, W//self.stride), mode='bilinear', align_corners=True)
+            a = F.interpolate(a, (H8, W8), mode='bilinear', align_corners=True)
+            b = F.interpolate(b, (H8, W8), mode='bilinear', align_corners=True)
+            c = F.interpolate(c, (H8, W8), mode='bilinear', align_corners=True)
+            d = F.interpolate(d, (H8, W8), mode='bilinear', align_corners=True)
             x = self.conv2(torch.cat([a,b,c,d], dim=1))
             x = self.norm2(x)
             x = self.relu2(x)
@@ -328,7 +319,8 @@ class DeltaBlock(nn.Module):
         
     def forward(self, fhid, fcorr, flow):
         B, S, D = flow.shape
-        assert(D==3)
+        assert (D == 3)
+
         flow_sincos = utils.misc.get_3d_embedding(flow, 64, cat_coords=True)
         x = torch.cat([fhid, fcorr, flow_sincos], dim=2) # B, S, -1
         delta = self.to_delta(x)
@@ -382,8 +374,8 @@ class CorrBlock:
         B, S, N, D = coords.shape
         assert(D==2)
 
-        x0 = coords[:,0,:,0].round().clamp(0, self.W-1).long()
-        y0 = coords[:,0,:,1].round().clamp(0, self.H-1).long()
+        x0 = coords[:,0,:,0]
+        y0 = coords[:,0,:,1]
 
         use_ones = True
         
@@ -432,13 +424,14 @@ class CorrBlock:
             self.corrs_pyramid.append(corrs)
 
 class Pips(nn.Module):
-    def __init__(self, S=8, stride=8):
+    def __init__(self, S=8, stride=8, iters=3, with_feature = False):
         super(Pips, self).__init__()
 
         self.S = S
         self.stride = stride
+        self.iters = iters
+        self.with_feature = with_feature
 
-        self.latent_dim = latent_dim = 256
         self.hidden_dim = hdim = 256
         self.latent_dim = latent_dim = 128
         self.corr_levels = 4
@@ -457,8 +450,7 @@ class Pips(nn.Module):
             nn.Linear(self.latent_dim, 1),
         )
 
-    def forward(self, xys, rgbs, coords_init=None, feat_init=None, iters=3, trajs_g=None, vis_g=None, valids=None, sw=None, return_feat=False):
-        total_loss = torch.tensor(0.0).cuda()
+    def forward(self, xys, rgbs, feat_init=None):
 
         B, N, D = xys.shape
         assert(D==2)
@@ -467,8 +459,8 @@ class Pips(nn.Module):
 
         rgbs = 2 * (rgbs / 255.0) - 1.0
 
-        H8 = H//self.stride
-        W8 = W//self.stride
+        H8 = torch.div(H, self.stride, rounding_mode='trunc')
+        W8 = torch.div(W, self.stride, rounding_mode='trunc')
 
         device = rgbs.device
 
@@ -476,59 +468,30 @@ class Pips(nn.Module):
         fmaps_ = self.fnet(rgbs_)
         fmaps = fmaps_.reshape(B, S, self.latent_dim, H8, W8)
 
-        if sw is not None and sw.save_this:
-            sw.summ_feats('tff/0_fmaps', fmaps.unbind(1))
-
         xys_ = xys.clone()/float(self.stride)
 
-        if coords_init is None:
-            coords = xys_.reshape(B, 1, N, 2).repeat(1, S, 1, 1) # init with zero vel
-        else:
-            coords = coords_init.clone() / self.stride
+        coords = xys_.reshape(B, 1, N, 2).repeat(1, S, 1, 1) # init with zero vel
 
         hdim = self.hidden_dim
 
         fcorr_fn = CorrBlock(fmaps, num_levels=self.corr_levels, radius=self.corr_radius)
 
-        if feat_init is None:
+        if self.with_feature and feat_init is not None:
+            ffeat = feat_init
+        else:
             # initialize features for the whole traj, using the initial feature
             ffeat = utils.samp.bilinear_sample2d(fmaps[:,0], coords[:,0,:,0], coords[:,0,:,1]).permute(0, 2, 1) # B, N, C
-        else:
-            ffeat = feat_init
-        ffeats = ffeat.unsqueeze(1).repeat(1, S, 1, 1) # B, S, N, C
-        
+
+        ffeats = ffeat.reshape((B, 1, N, ffeat.size()[-1])).repeat(1, S, 1, 1) # B, S, N, C
+
         coord_predictions = []
-        coord_predictions2 = []
-
-        # pause at beginning
-        coord_predictions2.append(coords.detach() * self.stride)
-        coord_predictions2.append(coords.detach() * self.stride)
-
         coords_bak = coords.clone()
 
         fcps = []
         ccps = []
         kps = []
 
-        if sw is not None and sw.save_this:
-            kp_vis = []
-            # vis init
-            for s in range(S):
-                if trajs_g is not None:
-                    e_ = coords_bak[0:1,s,0:1] # 1,1,2, in H8,W8 coords
-                    g_ = trajs_g[0:1,s,0:1]/float(self.stride) # 1,1,2, in H8,W8 coords
-                    kp = utils.improc.draw_circles_at_xy(torch.cat([e_, g_], dim=1), H8, W8, sigma=1).squeeze(2)
-                    kp = utils.improc.seq2color(kp, colormap='onediff')
-                else:
-                    kp = utils.improc.draw_circles_at_xy(coords[0:1,s,0:1], H8, W8, sigma=1).squeeze(2)
-                    kp = utils.improc.seq2color(kp, colormap='spring')
-                kp = utils.improc.back2color(kp)
-                kp_vis.append(kp)
-            kp_vis = torch.stack(kp_vis, dim=1)
-            kps.append(kp_vis)
-        
-
-        for itr in range(iters):
+        for itr in range(self.iters):
             coords = coords.detach()
 
             fcorr_fn.corr(ffeats)
@@ -560,7 +523,7 @@ class Pips(nn.Module):
 
             ffeats_ = ffeats_.reshape(B*N*S,self.latent_dim)
             delta_feats_ = delta_feats_.reshape(B*N*S, self.latent_dim)
-            ffeats_ = self.ffeat_updater(self.norm(delta_feats_)) + ffeats_
+            # ffeats_ = self.ffeat_updater(self.norm(delta_feats_)) + ffeats_
             ffeats = ffeats_.reshape(B, N, S, self.latent_dim).permute(0,2,1,3) # B,S,N,C
 
             coords = coords + delta_coords_.reshape(B, N, S, 2).permute(0,2,1,3)
@@ -568,79 +531,63 @@ class Pips(nn.Module):
             coords[:,0] = coords_bak[:,0] # lock coord0 for target
 
             coord_predictions.append(coords * self.stride)
-            coord_predictions2.append(coords * self.stride)
-
-            if sw is not None and sw.save_this:
-                kp_vis = []
-                for s in range(S):
-
-                    if trajs_g is not None:
-                        e_ = coords[0:1,s,0:1] # 1,1,2, in H8,W8 coords
-                        g_ = trajs_g[0:1,s,0:1]/float(self.stride) # 1,1,2, in H8,W8 coords
-                        kp = utils.improc.draw_circles_at_xy(torch.cat([e_, g_], dim=1), H8, W8, sigma=1).squeeze(2)
-                        kp = utils.improc.seq2color(kp, colormap='onediff')
-                    else:
-                        kp = utils.improc.draw_circles_at_xy(coords[0:1,s,0:1], H8, W8, sigma=1).squeeze(2)
-                        kp = utils.improc.seq2color(kp, colormap='spring')
-                                      
-                    kp = utils.improc.back2color(kp)
-                    kp_vis.append(kp)
-                kp_vis = torch.stack(kp_vis, dim=1)
-                kps.append(kp_vis)
 
         vis_e = self.vis_predictor(ffeats.reshape(B*S*N, self.latent_dim)).reshape(B,S,N)
 
-        # pause at the end
-        coord_predictions2.append(coords * self.stride)
-        coord_predictions2.append(coords * self.stride)
-
         fcps = torch.stack(fcps, dim=2) # B, S, I, N, H8, W8
-        if sw is not None and sw.save_this:
-            kps = torch.stack(kps, dim=2) # B, S, I, 3, H8, W8 
 
-            vis_all = []
-            vis_fcp = []
+        return coord_predictions[-1], vis_e, ffeat
 
-            fcps_ = fcps[0:1,:,:,0:1].detach() # 1,S,I,N,H8,W8
-            fcps_ = utils.basic.normalize(fcps_)
-            for s in range(S):
-                fcp = fcps_[0:1,s,:,0:1] # 1,I,1,H8,W8
-                fcp = torch.cat([fcp[:,0].unsqueeze(1), # zeroth
-                                 fcp,
-                                 fcp[:,-1].unsqueeze(1),
-                                 fcp[:,-1].unsqueeze(1)], dim=1) # pause on end
-                fcp_vis = sw.summ_oneds('tff/2_fcp_s%d' % s, fcp.unbind(1), norm=False, only_return=True)
-                vis_fcp.append(fcp_vis)
+if __name__ == '__main__':
+    import onnx
+    from onnxsim import simplify
 
-                kp = kps[0:1,s] # 1, I, 3, H8, W8
-                kp = torch.cat([kp,
-                                kp[:,-1].unsqueeze(1),
-                                kp[:,-1].unsqueeze(1)], dim=1) # pause on end
-                kp_vis = sw.summ_rgbs('tff/2_kp_s%d' % s, kp.unbind(1), only_return=True)
+    model = Pips(S=8, stride=4, iters=1, with_feature = False).cuda()
+    model.eval()
+    model_path = "../reference_model/model-000100000.pth"
+    checkpoint = torch.load(model_path)
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
 
-                kp_any = (torch.max(kp_vis, dim=2, keepdims=True)[0]).repeat(1, 1, 3, 1, 1)
-                kp_vis[kp_any==0] = fcp_vis[kp_any==0]
+    B, S, C, H, W = 1, 8, 3, 480, 640
+    N, D = 16*16, 2
 
-                vis_all.append(kp_vis)
-            vis_all = torch.stack(vis_all, dim=1) # B, S, I, 3, H8, W8 (but not quite I, due to padding)
-            vis_fcp = torch.stack(vis_fcp, dim=1) # B, S, I, 3, H8, W8 (but not quite I, due to padding)
-
-            vis_all = vis_all.permute(0, 2, 3, 1, 4, 5).reshape(1, -1, 3, S*H8, W8)
-            vis_fcp = vis_fcp.permute(0, 2, 3, 1, 4, 5).reshape(1, -1, 3, S*H8, W8)
-            sw.summ_rgbs('tff/2_kp_s', vis_all.unbind(1))
-
-        if trajs_g is not None:
-            seq_loss = sequence_loss(coord_predictions, trajs_g, vis_g, valids, 0.8)
-            vis_loss, _ = balanced_ce_loss(vis_e, vis_g)
-            ce_loss = score_map_loss(fcps, trajs_g/float(self.stride), vis_g, valids)
-            losses = (seq_loss, vis_loss, ce_loss)
-        else:
-            losses = None
-
-        if return_feat:
-            return coord_predictions, coord_predictions2, vis_e, ffeat, losses
-        else:
-            return coord_predictions, coord_predictions2, vis_e, losses
+    N_ = np.sqrt(N).round().astype(np.int32)
+    grid_y, grid_x = utils.basic.meshgrid2d(B, N_, N_, stack=False, norm=False, device='cuda')
+    grid_y = 8 + grid_y.reshape(B, -1) / float(N_ - 1) * (H - 16)
+    grid_x = 8 + grid_x.reshape(B, -1) / float(N_ - 1) * (W - 16)
+    xy = torch.stack([grid_x, grid_y], dim=-1)  # B, N_*N_, 2
 
 
+    img = torch.randn((B, S, C, H, W), dtype=torch.float32, device='cuda')
 
+    with torch.no_grad():
+        coord_predictions, vis_e, ffeat = model(xy, img)
+        # print(coord_predictions.shape)
+        # print(vis_e.shape)
+        # print(ffeat.shape)
+
+        print(coord_predictions.detach().cpu().numpy()[:,0,:,:].squeeze().astype(int))
+
+        # Export the model
+        onnx_path = "../pips.onnx"
+        torch.onnx.export(model,
+                          (xy, img),
+                          onnx_path,
+                          export_params=True,
+                          opset_version=16,
+                          do_constant_folding=True,
+                          input_names=['xy','img'],
+                          output_names=['coord_predictions', 'vis_e', 'ffeat'],
+                          dynamic_axes={'xy': {1: 'num_points'},
+                                        'coord_predictions': {2: 'num_points'},
+                                        'vis_e': {2: 'num_points'},
+                                        'ffeat': {1: 'num_points'}})
+
+        # load your predefined ONNX model
+        model = onnx.load(onnx_path)
+
+        # convert model
+        model_simp, check = simplify(model)
+
+        # save the converted model
+        onnx.save(model_simp, "../pips_simp.onnx")
