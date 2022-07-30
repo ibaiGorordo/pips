@@ -441,7 +441,7 @@ class Pips(nn.Module):
         
         self.delta_block = DeltaBlock(input_dim=self.latent_dim, hidden_dim=self.hidden_dim, corr_levels=self.corr_levels, corr_radius=self.corr_radius, S=self.S)
         
-        self.norm = nn.GroupNorm(1, self.latent_dim)
+        self.norm = nn.LayerNorm(self.latent_dim)
         self.ffeat_updater = nn.Sequential(
             nn.Linear(self.latent_dim, self.latent_dim),
             nn.GELU(),
@@ -523,7 +523,7 @@ class Pips(nn.Module):
 
             ffeats_ = ffeats_.reshape(B*N*S,self.latent_dim)
             delta_feats_ = delta_feats_.reshape(B*N*S, self.latent_dim)
-            # ffeats_ = self.ffeat_updater(self.norm(delta_feats_)) + ffeats_
+            ffeats_ = self.ffeat_updater(self.norm(delta_feats_)) + ffeats_
             ffeats = ffeats_.reshape(B, N, S, self.latent_dim).permute(0,2,1,3) # B,S,N,C
 
             coords = coords + delta_coords_.reshape(B, N, S, 2).permute(0,2,1,3)
